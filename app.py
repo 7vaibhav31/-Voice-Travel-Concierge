@@ -1,79 +1,92 @@
 import streamlit as st
 import requests
 import re
+import os
 from speech_to_text import get_text
 from text_to_speech import text_to_speech
 
+# ================= LOAD CSS =================
+with open("styles.css") as f:
+    st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
-
+# ================= PAGE CONFIG =================
+st.set_page_config(
+    page_title="Travel Concierge",
+    page_icon="🎒",
+    layout="centered"
+)
 
 # ================= CONFIG =================
 OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
-
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 MAIN_MODEL = "deepseek/deepseek-chat"
-
-SCALEDOWN_MODEL = "gpt-4o"   # optional, may fail → safe fallback
+SCALEDOWN_MODEL = "google/gemma-7b-it"
 
 COMMON_HEADERS = {
     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
     "Content-Type": "application/json",
     "HTTP-Referer": "http://localhost:8501",
-    "X-Title": "Voice Travel Concierge"
+    "X-Title": "Travel Concierge"
 }
 
-MAX_SPEECH_CHARS = 800  # 🔥 major speed-up
+MAX_SPEECH_CHARS = 700
 
-# ================= UTILS =================
-def extract_days(days_text: str) -> int:
-    match = re.search(r"\d+", days_text)
-    if match:
-        return int(match.group())
+# ================= SESSION STATE =================
+if "chat" not in st.session_state:
+    st.session_state.chat = []
 
-    word_map = {
-        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
-    }
+if "last_plan" not in st.session_state:
+    st.session_state.last_plan = ""
 
-    days_text = days_text.lower()
-    for word, number in word_map.items():
-        if word in days_text:
-            return number
+if "is_listening" not in st.session_state:
+    st.session_state.is_listening = False
 
-    raise ValueError("Days not understood")
+if "is_processing" not in st.session_state:
+    st.session_state.is_processing = False
 
-def make_speech_friendly(text: str) -> str:
-    lines = text.strip().splitlines()
-    speech_lines = []
+# ================= HEADER =================
+col_title, col_clear = st.columns([5, 1])
 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+with col_title:
+    st.markdown('<div class="main-title">Travel Concierge</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Smart trip planning using voice or text</div>', unsafe_allow_html=True)
 
-        if re.match(r"day\s*\d+", line.lower()):
-            num = re.findall(r"\d+", line)[0]
-            speech_lines.append(f"Day {num}.")
-        elif line.startswith("-"):
-            speech_lines.append(line.lstrip("-").strip() + ".")
-        else:
-            speech_lines.append(line + ".")
+with col_clear:
+    if st.button("🧹 Clear Chat"):
+        st.session_state.chat = []
+        st.session_state.last_plan = ""
+        st.rerun()
 
-    speech = " ".join(speech_lines)
-    speech = re.sub(r"\s+", " ", speech)
-    speech = re.sub(r"\.\.+", ".", speech)
+# ================= NLP HELPERS =================
+def extract_days(text):
+    m = re.search(r"\d+", text)
+    return int(m.group()) if m else 3
 
-    return speech.strip()
+def extract_source_dest(text):
+    m = re.search(r"from\s+(\w+)\s+to\s+(\w+)", text.lower())
+    if m:
+        return m.group(1).title(), m.group(2).title()
+    return "Unknown", "Unknown"
 
+def detect_intent(text):
+    text = text.lower()
+    if any(k in text for k in ["adventure", "trek", "hiking"]):
+        return "Adventure"
+    if any(k in text for k in ["luxury", "resort", "premium"]):
+        return "Luxury"
+    if any(k in text for k in ["budget", "cheap", "low cost"]):
+        return "Budget"
+    if any(k in text for k in ["relax", "chill", "beach"]):
+        return "Relax"
+    return "General"
 
-
-# ================= LLM CORE =================
-def call_llm(prompt: str , model: str, max_tokens: int ) -> str:
+# ================= LLM =================
+def call_llm(prompt, model, max_tokens=400):
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "You are a helpful AI assistant."},
+            {"role": "system", "content": "You are a professional travel planner."},
             {"role": "user", "content": prompt}
         ],
         "max_tokens": max_tokens
@@ -86,127 +99,96 @@ def call_llm(prompt: str , model: str, max_tokens: int ) -> str:
         timeout=30
     )
 
-    if r.status_code != 200:
-        st.error(f"LLM error {r.status_code}: {r.text}")
-        st.stop()
+    return r.json()["choices"][0]["message"]["content"] if r.status_code == 200 else ""
 
-    return r.json()["choices"][0]["message"]["content"]
-
-
-def optimize_text(text: str) -> str:
+def scale_down(text):
     prompt = f"""
-Clean and format the text below.
-Do NOT add new information.
-Keep meaning same.
-Use clean bullet points.
-
+Refine the itinerary:
+- Keep day-wise structure
+- Keep bullet points
+- Add spacing
 TEXT:
 {text}
 """
-    try:
-        return call_llm(prompt, SCALEDOWN_MODEL, 300)
-    except Exception:
-        return ""  # fallback handled later
+    result = call_llm(prompt, SCALEDOWN_MODEL, 300)
+    return result if result.strip() else text
 
+def make_speech_friendly(text):
+    text = re.sub(r"\*|_|`", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text[:MAX_SPEECH_CHARS]
 
-def extract_travel_details(sentence: str) -> str:
-    prompt = f"""
-Extract travel details.
+# ================= CHAT HISTORY =================
+for msg in st.session_state.chat:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-Sentence: {sentence}
+# ================= INPUT =================
+with st.form("chat_form", clear_on_submit=True):
+    user_input = st.text_input(
+        "Ask about your trip",
+        placeholder="Plan a 3 day trip from Delhi to Goa",
+        label_visibility="collapsed"
+    )
+    send = st.form_submit_button("Send")
 
-Return ONLY:
-Source:
-Destination:
-Days:
-"""
-    return call_llm(prompt, MAIN_MODEL, 150)
-
-
-def generate_itinerary(source: str, destination: str, days: int) -> str:
-    prompt = f"""
-Create a {days}-day travel itinerary.
-
-From: {source}
-Destination: {destination}
-
-Rules:
-- Day-wise plan
-- 3–4 activities per day
-- Short bullet points
-- No emojis
-- No extra text
-
-Format:
-
-Day 1:
-- activity
-- activity
-
-Day 2:
-- activity
-"""
-    return call_llm(prompt, MAIN_MODEL, 500)
-
-
-# ================= UI =================
-st.title("🎒 Voice Travel Concierge")
-
-user_input = st.text_input(
-    "Type your travel request (or use voice)",
-    placeholder="Plan a 3 day trip from Delhi to Paris"
-)
-
+# ================= MIC BUTTON =================
 if st.button("🎙️ Speak"):
-    voice_text = get_text()
-    if voice_text:
-        user_input = voice_text
-        st.success(f"You said: {user_input}")
-    else:
-        st.warning("Could not understand speech.")
+    st.session_state.is_listening = True
+    st.rerun()
 
-# ================= MAIN FLOW =================
-if user_input:
-    with st.spinner("Extracting travel details..."):
-        output = extract_travel_details(user_input)
+# ================= MIC LISTENING INDICATOR =================
+if st.session_state.is_listening:
+    with st.spinner("🎤 Listening..."):
+        voice = get_text()
 
-    st.subheader("🧾 Extracted Travel Details")
-    st.code(output)
+    st.session_state.is_listening = False
 
-    source = destination = days_text = None
+    if voice:
+        user_input = voice
+        send = True
 
-    for line in output.splitlines():
-        if line.lower().startswith("source"):
-            source = line.split(":", 1)[1].strip()
-        elif line.lower().startswith("destination"):
-            destination = line.split(":", 1)[1].strip()
-        elif line.lower().startswith("days"):
-            days_text = line.split(":", 1)[1].strip()
+# ================= PROCESS =================
+if send and user_input:
+    st.session_state.is_processing = True
 
-    if not (source and destination and days_text):
-        st.error("Failed to extract travel details.")
-        st.stop()
+    st.session_state.chat.append({"role": "user", "content": user_input})
 
-    try:
-        days = extract_days(days_text)
-    except ValueError:
-        st.error("Could not understand number of days.")
-        st.stop()
+    days = extract_days(user_input)
+    source, dest = extract_source_dest(user_input)
+    intent = detect_intent(user_input)
 
-    with st.spinner("Generating itinerary..."):
-        itinerary = generate_itinerary(source, destination, days)
+    info_block = f"""
+**📍 Source:** {source}  
+**🏁 Destination:** {dest}  
+**🕒 Duration:** {days} days  
+**🎯 Intent:** {intent}
+"""
+    st.session_state.chat.append({"role": "assistant", "content": info_block})
 
-    with st.spinner("Optimizing itinerary..."):
-        optimized = optimize_text(itinerary)
+    # 🔄 PROCESSING SPINNER (TEXT + VOICE)
+    with st.spinner("🧠 Planning your trip..."):
+        raw = call_llm(
+            f"""
+Create EXACTLY {days} days itinerary.
+Use bullet points.
+No paragraph text.
+""",
+            MAIN_MODEL
+        )
+        final_plan = scale_down(raw)
 
-    if optimized.strip():
-        itinerary = optimized  # safe fallback
+    st.session_state.last_plan = final_plan
+    st.session_state.chat.append({"role": "assistant", "content": final_plan})
 
-    st.subheader("🗺️ Generated Itinerary")
-    st.text(itinerary)
-    speech = make_speech_friendly(itinerary)
+    st.session_state.is_processing = False
+    st.rerun()
 
-    if st.button("🔊 Listen to itinerary"):
-        speech = speech[:MAX_SPEECH_CHARS]  # 🚀 speed-up
-        audio_file = text_to_speech(speech)
-        st.audio(audio_file, format="audio/mp3")
+# ================= AUDIO =================
+if st.session_state.last_plan:
+    st.markdown("---")
+    if st.button("🔊 Listen to last plan"):
+        with st.spinner("Generating audio..."):
+            audio_path = text_to_speech(make_speech_friendly(st.session_state.last_plan))
+        if audio_path and os.path.exists(audio_path):
+            st.audio(audio_path, format="audio/wav")

@@ -1,0 +1,42 @@
+/* App background */
+.stApp {
+    background: #f7f9fc;
+    font-family: "Segoe UI", sans-serif;
+}
+
+/* Title style */
+.main-title {
+    font-size: 44px;
+    font-weight: 800;
+    background: linear-gradient(90deg, #00bfa5, #7e57c2);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 4px;
+}
+
+.subtitle {
+    font-size: 15px;
+    color: #444;
+    margin-bottom: 20px;
+}
+
+/* Chat bubbles */
+.stChatMessage {
+    background-color: #ffffff;
+    color: #000000;              /* 🔥 TEXT COLOR FIX */
+    border-radius: 14px;
+    padding: 12px;
+    margin-bottom: 10px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+}
+
+/* Force markdown text black */
+.stMarkdown, .stMarkdown p, .stMarkdown li {
+    color: #000000 !important;
+}
+
+/* Buttons */
+button {
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+}
